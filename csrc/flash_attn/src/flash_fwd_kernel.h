@@ -248,7 +248,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
                                        binfo.actual_seqlen_q - m_block * kBlockM);
-    if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
+    if (Kernel_traits::Is_Q_in_regs) { 
+        // cute::cp_async_fence(); 
+        // for Turing
+        flash::cp_async_fence_if_enabled<Kernel_traits>();   
+    }
 
     // // if (cute::thread(1, 0)) { print(tQsQ); }
     // // Tensor sQNoSwizzle = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)), typename Kernel_traits::SmemLayoutQNoSwizzle{});
@@ -267,7 +271,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
-    cute::cp_async_fence();
+    // cute::cp_async_fence();
+    // for Turing
+    flash::cp_async_fence_if_enabled<Kernel_traits>();    
+    flash::smem_write_barrier_if_no_cp_async<Kernel_traits>();
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z < 2) { print(tKgK); }
     // __syncthreads();
 
@@ -313,7 +320,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
             );
         }
-        cute::cp_async_fence();
+        // cute::cp_async_fence();
+        // for Turing
+        flash::cp_async_fence_if_enabled<Kernel_traits>();
+        flash::smem_write_barrier_if_no_cp_async<Kernel_traits>();
 
         flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -334,7 +344,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
-            cute::cp_async_fence();
+            // cute::cp_async_fence();
+            // for Turing
+            flash::cp_async_fence_if_enabled<Kernel_traits>();            
+            flash::smem_write_barrier_if_no_cp_async<Kernel_traits>();
         }
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
@@ -380,7 +393,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         flash::cp_async_wait<0>();
         __syncthreads();
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
-        cute::cp_async_fence();
+        // cute::cp_async_fence();
+        // for Turing
+        flash::cp_async_fence_if_enabled<Kernel_traits>();        
+        flash::smem_write_barrier_if_no_cp_async<Kernel_traits>();
 
         flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -396,7 +412,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
-            cute::cp_async_fence();
+            // cute::cp_async_fence();
+            // for Turing
+            flash::cp_async_fence_if_enabled<Kernel_traits>();            
+            flash::smem_write_barrier_if_no_cp_async<Kernel_traits>();
         }
 
         mask.template apply_mask</*Causal_mask=*/false>(
@@ -823,7 +842,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
-    cute::cp_async_fence();
+    // cute::cp_async_fence();
+    // for Turing
+    flash::cp_async_fence_if_enabled<Kernel_traits>();    
+    flash::smem_write_barrier_if_no_cp_async<Kernel_traits>();
 
     // flash::cp_async_wait<0>();
     // __syncthreads();
@@ -873,7 +895,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
             );
         }
-        cute::cp_async_fence();
+        // cute::cp_async_fence();
+        // for Turing
+        flash::cp_async_fence_if_enabled<Kernel_traits>();        
+        flash::smem_write_barrier_if_no_cp_async<Kernel_traits>();
 
         flash::gemm(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -908,7 +933,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
-            cute::cp_async_fence();
+            // cute::cp_async_fence();
+            // for Turing
+            flash::cp_async_fence_if_enabled<Kernel_traits>();            
+            flash::smem_write_barrier_if_no_cp_async<Kernel_traits>();
         }
 
         // We have key_padding_mask so we'll need to Check_inf
@@ -949,7 +977,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
         }
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
-        cute::cp_async_fence();
+        // cute::cp_async_fence();
+        // for Turing
+        flash::cp_async_fence_if_enabled<Kernel_traits>();        
+        flash::smem_write_barrier_if_no_cp_async<Kernel_traits>();
 
         flash::gemm(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -975,7 +1006,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
-            cute::cp_async_fence();
+            // cute::cp_async_fence();
+            // for Turing
+            flash::cp_async_fence_if_enabled<Kernel_traits>();            
+            flash::smem_write_barrier_if_no_cp_async<Kernel_traits>();
         }
 
         mask.template apply_mask</*Causal_mask=*/false>(

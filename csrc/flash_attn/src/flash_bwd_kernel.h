@@ -374,7 +374,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
             gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
         );
-        flash::cp_async_fence();
+        // flash::cp_async_fence();
+        // for Turing
+        flash::cp_async_fence_if_enabled<Kernel_traits>();
     }
 
     Tensor tdOrdO = make_fragment_like(tdOgdO);
@@ -425,7 +427,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
         );
     }
-    flash::cp_async_fence();
+    // flash::cp_async_fence();
+    // for Turing
+    flash::cp_async_fence_if_enabled<Kernel_traits>();
 
     // if (cute::thread0()) { print(tdOgdO.layout()); printf("\n"); print(tdOrdO); print(tdOrO); }
     if (Is_first) {
@@ -434,8 +438,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                                                     Kernel_traits::kNThreads / (Kernel_traits::kGmemThreadsPerRow), params.p_dropout);
     }
 
-    if (Kernel_traits::Is_V_in_regs) {
-        cute::cp_async_wait<1>();
+    if (Kernel_traits::Is_V_in_regs) {        
+        // cute::cp_async_wait<1>();
+        // for Turing
+        flash::cp_async_wait_cute<1>();
         __syncthreads();
         Tensor tdPrV_copy_view = smem_thr_copy_KV.retile_D(tdPrV);
         CUTE_STATIC_ASSERT_V(size<1>(tdPsV) == size<1>(tdPrV_copy_view));            // M
@@ -454,7 +460,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
         clear(acc_s);
-        cute::cp_async_wait<0>();
+        // cute::cp_async_wait<0>();
+        // for Turing
+        flash::cp_async_wait_cute<0>();
         __syncthreads();
 
         Tensor dP_sum = make_fragment_like(lse);
@@ -550,9 +558,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         Tensor tPrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMmaSdP>(rP.layout()));
         Tensor tPaP = smem_thr_copy_PdS.retile_S(tPrP);     // ((Atom,AtomNum), MMA_N, MMA_N)
         cute::copy(smem_tiled_copy_PdS, tPaP, tPsP);
-        // if (cute::thread0()) { print(tPaP); }
-        // __syncthreads();
-        // if (cute::thread0()) { print(sP); }
 
         Tensor acc_dp = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
         CUTE_STATIC_ASSERT_V(size<0>(acc_dp) == size<0>(acc_s));                     // MMA
@@ -613,9 +618,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             // Advance gQ
             tQgQ.data() = tQgQ.data() + (-int(kBlockM * params.q_row_stride));
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ);
-            flash::cp_async_fence();
+            // flash::cp_async_fence();
+            // for Turing
+            flash::cp_async_fence_if_enabled<Kernel_traits>();
         }
 
+        // V105: Reverted to original layout (V103 convert_layout_acc_Aregs didn't fix dV)
         Tensor dS_reshaped = make_tensor(dS.data(), acc_dp.layout());
         // Convert dS from fp32 to fp16
         Tensor tdSrdS = flash::convert_type<Element>(dS_reshaped);
@@ -631,8 +639,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // flash::gemm_rs(acc_dk, tdKrdSt, tdKrQt, tdKsQt, tiled_mma_dkv, smem_thr_copy_QdOt);
         flash::gemm(acc_dv, tdVrPt, tdVrdO, tdVsPt, tdVsdOt, tiled_mma_dkv,
                     smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt);
-        // if (cute::thread0() && n_block == 0 && m_block == 0) { print(tdVrPt); }
-        // if (cute::thread0()) { print(acc_dv); }
 
         __syncthreads(); // Need syncthreads since we're writing to the same sdO location
 
@@ -645,7 +651,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_dO, tdOgO, tdOrO, tQcQ, tQpQ);
             } else {
                 flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_dO, tdOgdO, tdOsdO, tQcQ, tQpQ);
-                flash::cp_async_fence();
+                // flash::cp_async_fence();
+                // for Turing
+                flash::cp_async_fence_if_enabled<Kernel_traits>();
             }
         }
 
@@ -694,11 +702,15 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             // Advance gQ
             tQgQ.data() = tQgQ.data() + (-int(kBlockM * params.q_row_stride));
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ);
-            flash::cp_async_fence();
+            // flash::cp_async_fence();
+            // for Turing
+            flash::cp_async_fence_if_enabled<Kernel_traits>();
         }
 
         if (Is_first && m_block > m_block_min) {
             cute::copy(tdOrdO, tdOsdO);
+            // for Turing
+            __syncthreads();
             dot_do_o<Kernel_traits::kGmemThreadsPerRow>(tdOrdO, tdOrO, gdPsum,
                                                         Kernel_traits::kNThreads / (Kernel_traits::kGmemThreadsPerRow), params.p_dropout);
         }

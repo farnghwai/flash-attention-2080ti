@@ -289,6 +289,39 @@ void cp_async_wait() {
 #endif
 }
 
+// for Turing
+template <int N>
+CUTE_HOST_DEVICE
+void cp_async_wait_cute() {
+#if defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
+    cute::cp_async_wait<N>();
+#endif
+}
+
+// for Turing
+// Fence wrapper that is safe on SM75 (falls back to __syncthreads).
+// Use the templated version when you have a Kernel_traits type in scope.
+template <class Traits>
+__device__ __forceinline__ void cp_async_fence_if_enabled() {
+#if defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
+    if constexpr (Traits::Has_cp_async) { cute::cp_async_fence(); }
+    else { __syncthreads(); }
+#else
+    __syncthreads();
+#endif
+}
+
+// for Turing
+// Barrier used after synchronous GMEM->SMEM copies when cp.async isn't available.
+// On architectures with cp.async support we keep the behavior unchanged and avoid
+// the extra synchronization so the existing overlapping remains intact.
+template <class Traits>
+__device__ __forceinline__ void smem_write_barrier_if_no_cp_async() {
+    if constexpr (!Traits::Has_cp_async) {
+        __syncthreads();
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,

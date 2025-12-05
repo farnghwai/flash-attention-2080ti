@@ -11,10 +11,11 @@ from typing import List, Optional
 
 DTYPE_MAP = {
     "fp16": "cutlass::half_t",
-    "bf16": "cutlass::bfloat16_t",
+    # "bf16": "cutlass::bfloat16_t",
 }
 
-SM = [80]  # Sm80 kernels support up to
+# SM = [80]  # Sm80 kernels support up to
+SM = [75] # Sm75 kernels support only
 HEAD_DIMENSIONS = [32, 64, 96, 128, 160, 192, 256]
 IS_CAUSAL = ["false", "true"]
 KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_launch_template.h"

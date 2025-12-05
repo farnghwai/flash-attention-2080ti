@@ -16,6 +16,9 @@
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define ARCH_SUPPORTS_FLASH
 #define KERNEL_PARAM_MODIFIER __grid_constant__
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+#define ARCH_SUPPORTS_FLASH
+#define KERNEL_PARAM_MODIFIER __grid_constant__
 #else
 #define KERNEL_PARAM_MODIFIER
 #endif
@@ -45,6 +48,21 @@ DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel, bool 
     #endif
 }
 
+// for Turing
+static inline void fa2_set_dyn_smem_if_needed_sm75(const void* fptr, int smem_bytes) {
+  auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+  const bool is_sm75 = (cc_major == 7 && cc_minor == 5);
+  if (smem_bytes >= 48 * 1024) {
+    int optin = smem_bytes;
+    if (is_sm75) {
+      optin = std::min(smem_bytes, 64 * 1024);
+      TORCH_CHECK(smem_bytes <= 64 * 1024,
+        "SM75 requested dynamic shared memory (", smem_bytes, "B) > 64KiB; pick smaller tiles.");
+    }
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        fptr, cudaFuncAttributeMaxDynamicSharedMemorySize, optin));
+  }
+}
 
 template<bool Clear_dQaccum=true, typename Kernel_traits>
 __global__ void flash_bwd_dot_do_o_kernel(const Flash_bwd_params params) {
@@ -101,10 +119,13 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) 
                         // If Is_local, set Is_causal to false
                         auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout && !Is_softcap, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Is_softcap>;
                         // auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, false, Is_causal, false, false, true, true>;
-                        if (smem_size_dq_dk_dv >= 48 * 1024)  {
-                            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
-                        }
+                        // if (smem_size_dq_dk_dv >= 48 * 1024)  {
+                        //     C10_CUDA_CHECK(cudaFuncSetAttribute(
+                        //         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
+                        // }
+                        // for Turing
+                        fa2_set_dyn_smem_if_needed_sm75((const void*)kernel, smem_size_dq_dk_dv);
+
                         kernel<<<grid_n, Kernel_traits::kNThreads, smem_size_dq_dk_dv, stream>>>(params);
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                     });
@@ -114,10 +135,13 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) 
     });
 
     auto kernel_dq = &flash_bwd_convert_dq_kernel<Kernel_traits>;
-    if (Kernel_traits::kSmemdQSize >= 48 * 1024)  {
-        C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kernel_dq, cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel_traits::kSmemdQSize));
-    }
+    // if (Kernel_traits::kSmemdQSize >= 48 * 1024)  {
+    //     C10_CUDA_CHECK(cudaFuncSetAttribute(
+    //         kernel_dq, cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel_traits::kSmemdQSize));
+    // }
+    // for Turing
+    fa2_set_dyn_smem_if_needed_sm75((const void*)kernel_dq, Kernel_traits::kSmemdQSize);
+
     kernel_dq<<<grid_m, Kernel_traits::kNThreads, Kernel_traits::kSmemdQSize, stream>>>(params, !params.deterministic ? 1 : gridDimx);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -140,16 +164,20 @@ void run_mha_bwd_hdim32(Flash_bwd_params &params, cudaStream_t stream) {
     if (status_ != cudaSuccess) {
       C10_CUDA_CHECK(status_);
     }
+
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        if (max_smem_per_block >= 2 * ((3 * 128 + 2 * 128) * Headdim + 2 * 128 * 128)) { // 104 KB
-            if constexpr(!Is_dropout) {  // We can afford more registers to keep V in registers
-                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
-            } else {
-                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-            }
-        } else {  // 96 KB
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
-        }
+        // if (max_smem_per_block >= 2 * ((3 * 128 + 2 * 128) * Headdim + 2 * 128 * 128)) { // 104 KB
+        //     if constexpr(!Is_dropout) {  // We can afford more registers to keep V in registers
+        //         run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+        //     } else {
+        //         run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        //     }
+        // } else {  // 96 KB
+        //     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+        // }
+
+        // for Turing
+        run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
     });
 }
 
@@ -172,19 +200,22 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
         // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 2, 4, 4, false, false, T>>(params, stream);
         // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 4, false, false, T>, Is_dropout>(params, stream);
         // This is slightly faster. We want to split M more so we need fewer registers to store LSE.
-        if (max_smem_per_block >= 144 * 1024) {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-            // This has a lot of register spilling
-            // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout>(params, stream);
-        } else {
-            // if (params.h == params.h_k) {
-                // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, false, false, T>, Is_dropout>(params, stream);
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
-                // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 4, false, false, T>, Is_dropout>(params, stream);
-                // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 4, true, false, T>, Is_dropout>(params, stream);
-            // } else {
-            // }
-        }
+        // if (max_smem_per_block >= 144 * 1024) {
+        //     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        //     // This has a lot of register spilling
+        //     // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout>(params, stream);
+        // } else {
+        //     // if (params.h == params.h_k) {
+        //         // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, false, false, T>, Is_dropout>(params, stream);
+        //     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+        //         // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 4, false, false, T>, Is_dropout>(params, stream);
+        //         // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 4, true, false, T>, Is_dropout>(params, stream);
+        //     // } else {
+        //     // }
+        // }
+
+        // for Turing
+        run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
     });
     // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 4, true, false, T>>(params, stream);
     // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 4, 2, 2, 2, true, false, T>>(params, stream);
@@ -211,16 +242,19 @@ void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
     }
     // printf("max_smem_per_block = %d\n", max_smem_per_block);
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        if (max_smem_per_block >= 116 * 1024) {
-            if constexpr(!Is_dropout) {  // 92KB
-                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
-            } else {  // 116 KB
-                // This is faster for dropout since we don't have many registers to spare
-                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-            }
-        } else {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
-        }
+        // if (max_smem_per_block >= 116 * 1024) {
+        //     if constexpr(!Is_dropout) {  // 92KB
+        //         run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+        //     } else {  // 116 KB
+        //         // This is faster for dropout since we don't have many registers to spare
+        //         run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        //     }
+        // } else {
+        //     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+        // }
+        
+        // for Turing
+        run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
     });
 }
 
@@ -241,20 +275,23 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
         // This is faster, in the case of sequence-parallel bwd (where we need fewer registers).
         // Out of these three, the 2nd one is slightly faster (2% faster than the first). Idk why.
         // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 2, 2, false, false, T>>(params, stream);
-        if (max_smem_per_block >= 144 * 1024) {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 2, false, false, T>, Is_dropout, Is_causal>(params, stream);
-            // run_flash_bwd_seqk_parallel<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout>(params, stream);
-            // run_flash_bwd_seqk_parallel<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, true, T>, Is_dropout>(params, stream);
-            // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 2, true, false, T>, Is_dropout>(params, stream);
-            // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 2, false, false, T>, Is_dropout>(params, stream);
-            // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 2, true, false, T>, Is_dropout>(params, stream);
-        } else {
-            // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout>(params, stream);
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, true, false, T>, Is_dropout, Is_causal>(params, stream);
-        }
+        // if (max_smem_per_block >= 144 * 1024) {
+        //     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 2, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        //     // run_flash_bwd_seqk_parallel<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout>(params, stream);
+        //     // run_flash_bwd_seqk_parallel<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, true, T>, Is_dropout>(params, stream);
+        //     // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 2, true, false, T>, Is_dropout>(params, stream);
+        //     // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 2, false, false, T>, Is_dropout>(params, stream);
+        //     // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 2, true, false, T>, Is_dropout>(params, stream);
+        // } else {
+        //     // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout>(params, stream);
+        //     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, true, false, T>, Is_dropout, Is_causal>(params, stream);
+        // }
         // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, false, false, T>>(params, stream);
 
-        // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 4, 4, false, false, T>>(params, stream);
+        // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 4, 4, false, false, T>>(params, stream);   
+        
+        // for Turing
+        run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
     });
 }
 
@@ -270,11 +307,14 @@ void run_mha_bwd_hdim160(Flash_bwd_params &params, cudaStream_t stream) {
       C10_CUDA_CHECK(status_);
     }
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        if (max_smem_per_block >= 116 * 1024) {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-        } else {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, false, true, T>, Is_dropout, Is_causal>(params, stream);
-        }
+        // if (max_smem_per_block >= 116 * 1024) {
+        //     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        // } else {
+        //     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, false, true, T>, Is_dropout, Is_causal>(params, stream);
+        // }
+
+        // for Turing
+        run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 32, 64, 4, 2, 2, 2, true, true, T>, Is_dropout, Is_causal>(params, stream);
     });
 }
 
@@ -290,10 +330,17 @@ void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
       C10_CUDA_CHECK(status_);
     }
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        if (max_smem_per_block >= 136 * 1024) {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        // if (max_smem_per_block >= 136 * 1024) {
+        //     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        // } else {
+        //     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, true, true, T>, Is_dropout, Is_causal>(params, stream);
+        // }        
+
+        // for Turing
+        if constexpr (Is_dropout) {
+            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 32, 32, 2, 2, 1, 1, true, true, T>, Is_dropout, Is_causal>(params, stream);
         } else {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, true, true, T>, Is_dropout, Is_causal>(params, stream);
+            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 32, 32, 4, 2, 2, 2, true, true, T>, Is_dropout, Is_causal>(params, stream);
         }
     });
 }
@@ -310,14 +357,21 @@ void run_mha_bwd_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
       C10_CUDA_CHECK(status_);
     }
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        if (max_smem_per_block >= 176 * 1024) {  // H100
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout, Is_causal>(params, stream);
-        } else if (max_smem_per_block >= 144 * 1024) {  // A100, we don't do double buffering to save smem
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, true, T>, Is_dropout, Is_causal>(params, stream);
-        } else { // sm86 and sm89, max smem is 99 KB. Only works without dropout. V in regs and no double buffering.
-            if constexpr (!Is_dropout) {
-                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 32, 8, 4, 1, 2, true, true, T>, false, Is_causal>(params, stream);
-            }
+        // if (max_smem_per_block >= 176 * 1024) {  // H100
+        //     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        // } else if (max_smem_per_block >= 144 * 1024) {  // A100, we don't do double buffering to save smem
+        //     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, true, T>, Is_dropout, Is_causal>(params, stream);
+        // } else { // sm86 and sm89, max smem is 99 KB. Only works without dropout. V in regs and no double buffering.
+        //     if constexpr (!Is_dropout) {
+        //         run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 32, 8, 4, 1, 2, true, true, T>, false, Is_causal>(params, stream);
+        //     }
+        // }
+       
+        // for Turing
+        if constexpr (Is_dropout) {
+            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 32, 32, 2, 2, 1, 1, true, true, T>, Is_dropout, Is_causal>(params, stream);
+        } else {
+            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 32, 32, 4, 2, 2, 2, true, true, T>, Is_dropout, Is_causal>(params, stream);
         }
     });
 }

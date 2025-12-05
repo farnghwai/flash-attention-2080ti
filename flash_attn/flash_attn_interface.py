@@ -24,6 +24,7 @@ def _get_block_size_n(device, head_dim, is_dropout, is_causal):
     # This should match the block sizes in the CUDA kernel
     assert head_dim <= 256
     major, minor = torch.cuda.get_device_capability(device)
+    is_sm75 = major == 7 and minor == 5  # Turing
     is_sm8x = major == 8 and minor > 0  # Only include sm86 and sm89, exclude sm80 (A100)
     is_sm80 = major == 8 and minor == 0
     is_sm90 = major == 9 and minor == 0
@@ -34,21 +35,36 @@ def _get_block_size_n(device, head_dim, is_dropout, is_causal):
     elif head_dim <= 96:
         return 64
     elif head_dim <= 128:
+        # SM75: Always uses 64×64 tiles for d=128 (64KB smem limit)
+        if is_sm75:
+            return 64
         if is_sm8x:
             return 64 if (not is_dropout and is_causal) else 32
         else:
             return 64 if not is_dropout else 32
     elif head_dim <= 160:
+        if is_sm75:
+            return 64  # SM75: unified kBlockN=64 for d=160
         if is_sm8x:
             return 64
         else:
             return 32
     elif head_dim <= 192:
-        return 64
+        # SM75: kBlockN=32 for both dropout and non-dropout (kBlockM=64 for dropout)
+        if is_sm75:
+            return 32
+        else:
+            return 64
     elif head_dim <= 224:
-        return 64
+        if is_sm75:
+            return 32
+        else:        
+            return 64
     elif head_dim <= 256:
-        return 64
+        if is_sm75:
+            return 32
+        else:        
+            return 64
 
 
 def round_multiple(x, m):
@@ -93,6 +109,14 @@ def _flash_attn_forward(
     return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    major, minor = torch.cuda.get_device_capability(q.device)
+    is_sm75 = (major == 7 and minor == 5)
+    if is_sm75:
+        # Turing path supports fp16 only
+        assert q.dtype == torch.float16 and k.dtype == torch.float16 and v.dtype == torch.float16, \
+            "FlashAttention on SM75 supports float16 only"
+        # vectorized ld.global.v4.b16 prefers D % 8 == 0
+        assert (q.shape[-1] % 8) == 0, f"headdim must be multiple of 8 on SM75 (got {q.shape[-1]})"    
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
         q,
         k,

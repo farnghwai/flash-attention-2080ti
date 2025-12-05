@@ -36,9 +36,20 @@ struct Flash_kernel_traits {
     using MMA_Atom_Arch = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
 #endif
 
+    // SM75 multi-tile optimization: true if single tile (d=32,64), false if multi-tile (d=96,128,160,192,256)
+    // for Turing
+    static constexpr bool kSingleTile = (kHeadDim_ == 32 || kHeadDim_ == 64);
+
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 750
-    using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
-    using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
+    // SM75+: Single tile (d=32,64) uses K=16+U32x4/U16x8, multi-tile (d=96,128,160,192,256) uses K=8+U32x2/U16x4
+    // K dimension determines LDSM width: K=16 needs 8 halfs (U16x8), K=8 needs 4 halfs (U16x4)
+    // for Turing
+    using SmemCopyAtom = Copy_Atom<
+        std::conditional_t<kSingleTile, SM75_U32x4_LDSM_N, SM75_U32x2_LDSM_N>,
+        elem_type>;
+    using SmemCopyAtomTransposed = Copy_Atom<
+        std::conditional_t<kSingleTile, SM75_U16x8_LDSM_T, SM75_U16x4_LDSM_T>,
+        elem_type>;
 #else
     using SmemCopyAtom = Copy_Atom<DefaultCopy, elem_type>;
     using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, elem_type>;
@@ -70,11 +81,22 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
     static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
-
+    
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+    // N tile dimension stays the same (_16), only K changes to avoid TiledCopy incompatibility
+    // for Turing
+    using TiledMma = TiledMMA<
+        typename Base::MMA_Atom_Arch,
+        Layout<Shape<Int<kNWarps>,_1,_1>>,
+        std::conditional_t<Base::kSingleTile,
+            Tile<Int<16 * kNWarps>, _16, _16>,
+            Tile<Int<16 * kNWarps>, _16, _8>>>;
+#else
     using TiledMma = TiledMMA<
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
         Tile<Int<16 * kNWarps>, _16, _16>>;
+#endif
 
     using SmemLayoutAtomQ = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},
@@ -192,6 +214,30 @@ struct Flash_bwd_kernel_traits : public Base {
     static_assert(kNWarps % AtomLayoutNdKV == 0);
     static_assert(kNWarps % AtomLayoutMdQ == 0);
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+    // N tile dimension stays the same (16*...), only K changes to avoid TiledCopy incompatibility
+    // for Turing
+    using TiledMmaSdP = TiledMMA<
+        typename Base::MMA_Atom_Arch,
+        Layout<Shape<Int<AtomLayoutMSdP>, Int<kNWarps / AtomLayoutMSdP>, _1>>,
+        std::conditional_t<Base::kSingleTile,
+            Tile<Int<16 * AtomLayoutMSdP>, Int<16 * kNWarps / AtomLayoutMSdP>, _16>,
+            Tile<Int<16 * AtomLayoutMSdP>, Int<16 * kNWarps / AtomLayoutMSdP>, _8>>>;
+
+    using TiledMmadKV = TiledMMA<
+        typename Base::MMA_Atom_Arch,
+        Layout<Shape<Int<AtomLayoutNdKV>, Int<kNWarps / AtomLayoutNdKV>, _1>>,
+        std::conditional_t<Base::kSingleTile,
+            Tile<Int<16 * AtomLayoutNdKV>, Int<16 * kNWarps / AtomLayoutNdKV>, _16>,
+            Tile<Int<16 * AtomLayoutNdKV>, Int<16 * kNWarps / AtomLayoutNdKV>, _8>>>;
+
+    using TiledMmadQ = TiledMMA<
+        typename Base::MMA_Atom_Arch,
+        Layout<Shape<Int<AtomLayoutMdQ>, Int<kNWarps / AtomLayoutMdQ>, _1>>,
+        std::conditional_t<Base::kSingleTile,
+            Tile<Int<16 * AtomLayoutMdQ>, Int<16 * kNWarps / AtomLayoutMdQ>, _16>,
+            Tile<Int<16 * AtomLayoutMdQ>, Int<16 * kNWarps / AtomLayoutMdQ>, _8>>>;
+#else
     using TiledMmaSdP = TiledMMA<
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<AtomLayoutMSdP>, Int<kNWarps / AtomLayoutMSdP>, _1>>,
@@ -206,6 +252,7 @@ struct Flash_bwd_kernel_traits : public Base {
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<AtomLayoutMdQ>, Int<kNWarps / AtomLayoutMdQ>, _1>>,  // 2x4x1 or 4x2x1 thread group
         Tile<Int<16 * AtomLayoutMdQ>, Int<16 * kNWarps / AtomLayoutMdQ>, _16>>;
+#endif
 
     using SmemLayoutAtomQdO = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},
@@ -321,22 +368,44 @@ struct Flash_bwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, elem_type>{},
                         GmemLayoutAtom{},
                         Layout<Shape < _1, _8>>{}));  // Val layout, 8 vals per store
+    // Thread layout for dQaccum copy depends on kBlockKSmem and kNWarps
+    // kBlockKSmem=32: 32x8 = 256 threads (8 warps) or 16x8 = 128 threads (4 warps) or 8x8 = 64 threads (2 warps)
+    // kBlockKSmem=64: 16x16 = 256 threads (8 warps) or 8x16 = 128 threads (4 warps) or 4x16 = 64 threads (2 warps)
+    // for Turing
     using GmemLayoutAtomdQaccum = std::conditional_t<
         kBlockKSmem == 32,
-        Layout<Shape <_32, _8>,  // Thread layout, 8 threads per row
-               Stride< _8, _1>>,
-        Layout<Shape <_16, _16>,  // Thread layout, 16 threads per row
-               Stride< _16, _1>>
+        std::conditional_t<kNWarps_ == 2,
+            Layout<Shape <_8, _8>, Stride< _8, _1>>,    // 64 threads (2 warps)
+            std::conditional_t<kNWarps_ == 4,
+                Layout<Shape <_16, _8>, Stride< _8, _1>>,   // 128 threads (4 warps)
+                Layout<Shape <_32, _8>, Stride< _8, _1>>>>, // 256 threads (8 warps)
+        std::conditional_t<kNWarps_ == 2,
+            Layout<Shape <_4, _16>, Stride< _16, _1>>,  // 64 threads (2 warps)
+            std::conditional_t<kNWarps_ == 4,
+                Layout<Shape <_8, _16>, Stride< _16, _1>>,  // 128 threads (4 warps)
+                Layout<Shape <_16, _16>, Stride< _16, _1>>>> // 256 threads (8 warps)
     >;
     using GmemTiledCopydQaccum = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
                         GmemLayoutAtomdQaccum{},
                         Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
 
+    // Thread layout for dQaccum atomic add depends on number of warps
+    // 8 warps (256 threads): 8 rows x 32 cols
+    // 4 warps (128 threads): 4 rows x 32 cols
+    // 2 warps (64 threads): 2 rows x 32 cols
+    // for Turing
+    using GmemLayoutAtomdQaccumAtomicAdd = std::conditional_t<
+        kNWarps_ == 2,
+        Layout<Shape <_2, _32>, Stride<_32, _1>>,  // 64 threads (2 warps)
+        std::conditional_t<kNWarps_ == 4,
+            Layout<Shape <_4, _32>, Stride<_32, _1>>,  // 128 threads (4 warps)
+            Layout<Shape <_8, _32>, Stride<_32, _1>>>  // 256 threads (8 warps)
+    >;
     using GmemTiledCopydQaccumAtomicAdd = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
-                        Layout<Shape <_8, _32>,  // Thread layout, 8 threads per row
-                               Stride<_32, _1>>{},
+                        // for Turing
+                        GmemLayoutAtomdQaccumAtomicAdd{},
                         Layout<Shape < _1, _1>>{}));  // Val layout, 1 val per store
 
 };
